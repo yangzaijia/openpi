@@ -143,6 +143,12 @@ def create_torch_dataset(
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        # 唯一一处相对上游的改动（DynaRobot）。lerobot 的 get_safe_default_codec() 只检查
+        # torchcodec 这个包在不在，不检查它能否加载；本集群的计算节点没有 ffmpeg，
+        # torchcodec 找不到 libavutil.so.56-60 就直接崩，永远走不到它自己的 pyav 回退分支。
+        # pyav 自带 ffmpeg（实测能解 RoboTwin 的 AV1，用 libdav1d），且与师兄训 tokenizer 时
+        # 的解码路径一致。baseline 与 B1 共用此设置，不影响两者对比。
+        video_backend="pyav",
     )
 
     if data_config.prompt_from_task:
