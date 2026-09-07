@@ -997,6 +997,12 @@ _CONFIGS = [
                                 "cam_left_wrist": "observation.images.cam_left_wrist",
                                 "cam_right_wrist": "observation.images.cam_right_wrist",
                             },
+                            # prompt 必须显式带过来：PromptFromLeRobotTask 在 repack **之前**包住原始
+                            # LeRobotDataset（data_loader.py:154），把每集的语言指令写进 "prompt"；而
+                            # RepackTransform 是按映射表**重建**一个新 dict，没列出的键会被丢掉。漏了这
+                            # 一行的后果是 transforms.py:254 抛 ValueError("Prompt is required")（作业
+                            # 144314 就是这么挂的）。官方 Libero / Droid 的 repack 也都显式列了这一行。
+                            "prompt": "prompt",
                             "state": "observation.state",
                             "actions": "action",
                         }
