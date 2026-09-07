@@ -965,6 +965,64 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
+    #
+    # DynaRobot Stage 2 —— RoboTwin 2.0 官方数据（StarVLA/RoboTwin-Clean，50 任务合并成一个
+    # LeRobot 数据集：2500 集 / 549,787 帧 / 2414 条指令），aloha-agilex(arx5)，15 fps。
+    # 这是 B 线的 baseline：纯原版 π0.5，不含任何动态 token 改动。
+    #
+    TrainConfig(
+        name="pi05_robotwin",
+        # action_horizon=10 @15fps = 0.67 s，与 B1 动态 token 的时间跨度（k=10）对齐。
+        # 不设 discrete_state_input：pi05_base 的参数里没有 state_proj，设成 False 会
+        # 凭空造一个随机初始化的 state 通路，预训练权重填不进去。
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10),
+        data=LeRobotAlohaDataConfig(
+            # LeRobot 从 $HF_LEROBOT_HOME/<repo_id> 找数据；不设 assets.asset_id，
+            # 让它默认等于 repo_id，这样 compute_norm_stats 的写入路径和训练时的读取路径一致。
+            repo_id="RoboTwin-Clean-merged",
+            # adapt_to_pi=True 会按 Trossen ALOHA 约定翻转关节符号 [1,-1,-1,1,...]，并用
+            # Interbotix 硬件常数（arm_length=0.036, horn_radius=0.022）把夹爪从线性空间
+            # 换算到角度空间。RoboTwin 用的是 arx5，夹爪本身已是 0/1 归一化，套用会得到错误数值。
+            adapt_to_pi=False,
+            # RoboTwin 的 action 是绝对关节角（实测与 state 同一数值空间，action[t]-state[t]
+            # 均值仅 0.0094 rad），转成相对 chunk 起点 state 的增量；夹爪保持绝对值。
+            use_delta_joint_actions=True,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(prompt_from_task=True),  # 每集自带语言指令
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        # decay_lr == peak_lr，等价于 warmup 之后学习率恒定（沿用 pi05_zaijia 的调度）
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        batch_size=32,
+        num_workers=10,
+        num_train_steps=60_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        fsdp_devices=1,
+        seed=42,
+        assets_base_dir="/projects/zaijia001/DynaRobot/assets",
+        checkpoint_base_dir="/projects/_hdd/zaijia/dynarobot_checkpoints",  # ckpt 约 11 GB/个，放 HDD
+    ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
