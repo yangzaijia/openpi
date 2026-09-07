@@ -972,6 +972,7 @@ _CONFIGS = [
     #
     TrainConfig(
         name="pi05_robotwin",
+        project_name="dynarobot_pi05",   # wandb 项目；team(entity) 由 WANDB_ENTITY 指定为 dynamic1
         # action_horizon=10 @15fps = 0.67 s，与 B1 动态 token 的时间跨度（k=10）对齐。
         # 不设 discrete_state_input：pi05_base 的参数里没有 state_proj，设成 False 会
         # 凭空造一个随机初始化的 state 通路，预训练权重填不进去。
