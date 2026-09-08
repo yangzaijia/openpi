@@ -84,6 +84,13 @@ class AlohaInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        # B1（DynaRobot）：本函数是**重建** dict，没显式列出的键一律丢掉。
+        # 动态码标签由 InjectDynCodes 在更早一步写入，这里必须原样带过去，
+        # 否则 compute_loss 里 observation.dyn_codes 恒为 None，CE 静默失效。
+        for k in ("dyn_codes", "dyn_codes_mask"):
+            if k in data:
+                inputs[k] = data[k]
+
         return inputs
 
 

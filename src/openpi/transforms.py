@@ -342,12 +342,23 @@ class InjectDynCodes(DataTransformFn):
                 f"现有键: {sorted(data)}"
             )
         codes, valid = _load_dyn_codes(self.npz_path)
-        idx = np.asarray(data[self.index_key]).reshape(-1)
-        if idx.max(initial=0) >= codes.shape[0]:
-            raise ValueError(f"帧号 {idx.max()} 超出码表长度 {codes.shape[0]}，码表和数据集对不上")
+        idx = np.asarray(data[self.index_key])
+        flat = idx.reshape(-1)
+        if flat.max(initial=0) >= codes.shape[0]:
+            raise ValueError(f"帧号 {flat.max()} 超出码表长度 {codes.shape[0]}，码表和数据集对不上")
         # -1（无效帧）夹到 0：CE 那边靠 dyn_codes_mask 屏蔽，这个值不会被用到
-        data["dyn_codes"] = np.maximum(codes[idx], 0).astype(np.int32)
-        data["dyn_codes_mask"] = valid[idx].astype(bool)
+        c = np.maximum(codes[flat], 0).astype(np.int32)     # [n, 12]
+        v = valid[flat].astype(bool)                        # [n]
+        # **保持输入的批结构**：这个变换作用在单个样本上时 index 是标量，
+        # 输出必须是 [12] / 标量，而不是 [1,12] / [1]。多出来的那一维会在 collate
+        # 之后变成 [B,1,12]，让 Observation 的 [*b n] 注解报错，CE 也会错位。
+        if idx.ndim == 0:
+            c, v = c[0], v[0]
+        else:
+            c = c.reshape(*idx.shape, c.shape[-1])
+            v = v.reshape(idx.shape)
+        data["dyn_codes"] = c
+        data["dyn_codes_mask"] = v
         return data
 
 
