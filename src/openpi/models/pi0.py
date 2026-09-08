@@ -99,6 +99,36 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
+
+        # ── B1：VLM 尾部的动态槽位（dyn_slots=0 时下面什么都不建，等于上游）──────
+        self.dyn_slots = config.dyn_slots
+        self.dyn_ce_weight = config.dyn_ce_weight
+        self.dyn_branch_sizes = tuple(config.dyn_branch_sizes)
+        if self.dyn_slots > 0:
+            assert sum(self.dyn_branch_sizes) == self.dyn_slots, (
+                "dyn_branch_sizes 之和必须等于 dyn_slots"
+            )
+            # VLM 的宽度直接取 paligemma_config（gemma_2b=2048；dummy=64）。
+            # 不能猜 —— 猜 2048 会在 dummy 变体上拼接失败。
+            vlm_width = paligemma_config.width
+            # 每个槽位一个可学习嵌入向量，作为 VLM 的额外输入 token
+            self.dyn_slot_emb = nnx.Param(
+                jax.random.normal(rngs.params(), (self.dyn_slots, vlm_width)) * 0.02
+            )
+            n_cls = config.dyn_codebook_size
+            if config.dyn_ce_head_mode == "per_slot":
+                # 12 个独立头：槽位 i 用 W_i，各自适配该位置的分布
+                self.dyn_heads = [
+                    nnx.Linear(vlm_width, n_cls, rngs=rngs) for _ in range(self.dyn_slots)
+                ]
+            elif config.dyn_ce_head_mode == "per_branch":
+                # 3 个头：同一分支的 4 个槽位共享一个 W（它们索引的本来就是同一张码表）
+                self.dyn_heads = [
+                    nnx.Linear(vlm_width, n_cls, rngs=rngs) for _ in self.dyn_branch_sizes
+                ]
+            else:
+                raise ValueError(f"未知的 dyn_ce_head_mode: {config.dyn_ce_head_mode}")
+            self.dyn_ce_head_mode = config.dyn_ce_head_mode
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
@@ -131,6 +161,21 @@ class Pi0(_model.BaseModel):
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
+        # ── B1：在 image/text 之后追加 dyn_slots 个可学习槽位 ──────────────────
+        # ar_mask 给 [True] + [False]*(n-1)：槽位自成一块（cumsum=1），于是
+        #   · 槽位能 attend 到 image/text（cumsum 0 ≤ 1）✓ 它需要看图才能预测动态
+        #   · image/text attend 不到槽位（0 < 1）✓ 用户选的"槽位只读"，前向计算不受污染
+        # 动作专家的屏蔽做不到这里 —— make_attn_mask 是单调 cumsum，后面的块必然看得到
+        # 前面的块。所以那一步在 compute_loss 里显式改掩码。
+        if self.dyn_slots > 0:
+            b = tokens[0].shape[0] if isinstance(tokens, list) else tokens.shape[0]
+            slot_tokens = jnp.broadcast_to(
+                self.dyn_slot_emb.value[None], (b, self.dyn_slots, self.dyn_slot_emb.value.shape[-1])
+            )
+            tokens.append(slot_tokens)
+            input_mask.append(jnp.ones((b, self.dyn_slots), dtype=jnp.bool_))
+            ar_mask += [True] + [False] * (self.dyn_slots - 1)
+
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
@@ -206,12 +251,62 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
+
+        if self.dyn_slots > 0:
+            n_prefix = prefix_tokens.shape[1]
+            slot_lo, slot_hi = n_prefix - self.dyn_slots, n_prefix
+
+            # (a) B1：动作专家看不到槽位。make_attn_mask 是单调 cumsum，后面的块必然
+            #     看得到前面的块，光靠 ar_mask 屏蔽不掉，只能在这里把
+            #     「suffix 行 × 槽位列」显式置 False。**这一行就是 B1 与 B2 的全部区别。**
+            attn_mask = attn_mask.at[:, n_prefix:, slot_lo:slot_hi].set(False)
+
+            # (b) 槽位不占位置编号。否则动作 token 的 RoPE 位置会整体后移 dyn_slots，
+            #     与 B0 不可比（动作到图像的相对距离被拉远）。让动作 token 的位置从
+            #     "image/text 之后"接着数，和 B0 完全一致；槽位与动作 token 位置编号
+            #     重叠是安全的 —— 它们互不可见。
+            base = jnp.cumsum(input_mask[:, :slot_lo], axis=1) - 1        # image/text: 0..n-1
+            n_img_txt = base[:, -1:] + 1
+            slot_pos = n_img_txt + jnp.arange(self.dyn_slots)[None, :]
+            suffix_pos = n_img_txt + jnp.arange(suffix_tokens.shape[1])[None, :]
+            positions = jnp.concatenate([base, slot_pos, suffix_pos], axis=1)
+
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        flow_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)              # [b, ah]
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        # (c) B1 的辅助损失：12 路 CE。标签是师兄 tokenizer 离线算好的动态码。
+        #     专家看不到槽位，所以这条损失影响模型的**唯一**路径是梯度回传去塑造
+        #     共享的 VLM 权重 —— 这正是要回答的问题。
+        if self.dyn_slots > 0 and observation.dyn_codes is not None:
+            slot_out = prefix_out[:, -self.dyn_slots :]                   # [b, n_slot, width]
+            logits = []
+            if self.dyn_ce_head_mode == "per_slot":
+                for i in range(self.dyn_slots):
+                    logits.append(self.dyn_heads[i](slot_out[:, i]))
+            else:  # per_branch：同一分支的槽位共用一个头
+                i = 0
+                for h, n in zip(self.dyn_heads, self.dyn_branch_sizes, strict=True):
+                    for _ in range(n):
+                        logits.append(h(slot_out[:, i])); i += 1
+            logits = jnp.stack(logits, axis=1)                            # [b, n_slot, n_cls]
+            logp = jax.nn.log_softmax(logits, axis=-1)
+            tgt = jax.nn.one_hot(observation.dyn_codes, logits.shape[-1])
+            ce = -jnp.sum(logp * tgt, axis=-1)                            # [b, n_slot]
+            if observation.dyn_codes_mask is not None:
+                # t+k 越过 episode 末尾的样本没有合法标签，不参与 CE
+                w = observation.dyn_codes_mask.astype(ce.dtype)[:, None]
+                ce = ce * w
+                denom = jnp.maximum(jnp.sum(w), 1.0) * ce.shape[1]
+            else:
+                denom = ce.size
+            ce_mean = jnp.sum(ce) / denom
+            # 摊回 [b, ah] 的形状，好让上层的 jnp.mean 得到 flow + w·CE
+            flow_loss = flow_loss + self.dyn_ce_weight * ce_mean
+
+        return flow_loss
 
     @override
     def sample_actions(

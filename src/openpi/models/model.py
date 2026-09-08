@@ -106,6 +106,12 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # B1（DynaRobot）专用：师兄 tokenizer 对 (O_t, O_t+k) 离线算好的动态码。
+    # dyn_codes[b, i] ∈ [0, 64) 是第 i 个槽位该预测的码；dyn_codes_mask[b] 为 False 时
+    # 该样本不参与 CE（例如 t+k 越过了 episode 末尾，没有合法的未来帧）。
+    dyn_codes: at.Int[ArrayT, "*b n"] | None = None
+    dyn_codes_mask: at.Bool[ArrayT, "*b"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -126,6 +132,8 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            dyn_codes=data.get("dyn_codes"),
+            dyn_codes_mask=data.get("dyn_codes_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -205,6 +213,10 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        # B1：这个函数是**逐字段重建** Observation 的，新增字段必须显式列在这里，
+        # 否则会被静默丢掉（compute_loss 一进来就调它，标签就没了）。
+        dyn_codes=observation.dyn_codes,
+        dyn_codes_mask=observation.dyn_codes_mask,
     )
 
 
