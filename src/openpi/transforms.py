@@ -306,6 +306,51 @@ class ExtractFASTActions(DataTransformFn):
         }
 
 
+_DYN_CODE_CACHE: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+
+def _load_dyn_codes(path: str) -> tuple[np.ndarray, np.ndarray]:
+    """按路径缓存加载动态码表。dataloader 的每个 worker 各加载一次（约 6 MB，可忽略）。"""
+    if path not in _DYN_CODE_CACHE:
+        d = np.load(path)
+        codes, valid = d["codes"], d["valid"]
+        if codes.shape[0] != valid.shape[0]:
+            raise ValueError(f"{path}: codes/valid 长度不一致 {codes.shape} vs {valid.shape}")
+        _DYN_CODE_CACHE[path] = (codes, valid)
+    return _DYN_CODE_CACHE[path]
+
+
+@dataclasses.dataclass(frozen=True)
+class InjectDynCodes(DataTransformFn):
+    """B1（DynaRobot）：按全局帧号注入师兄 tokenizer 离线算好的 12 个动态码。
+
+    npz 由 gen_labels2.py 产出：codes int8[N,12]（无效帧为 -1）、valid bool[N]。
+    N 等于数据集长度，下标就是 LeRobotDataset 样本里的 "index" 字段，直接查表。
+
+    放在 RepackTransform **之后**。注意 repack 会重建 dict、丢掉没列出的键，
+    所以 "index" 必须在 repack 的映射表里显式带过来（和当初 "prompt" 那个坑一样）。
+    """
+
+    npz_path: str
+    index_key: str = "index"
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if self.index_key not in data:
+            raise ValueError(
+                f"InjectDynCodes 需要 '{self.index_key}' 字段，batch 里没有。"
+                f"多半是 RepackTransform 没把它带过来 —— repack 按映射表重建 dict，没列出的键会被丢掉。"
+                f"现有键: {sorted(data)}"
+            )
+        codes, valid = _load_dyn_codes(self.npz_path)
+        idx = np.asarray(data[self.index_key]).reshape(-1)
+        if idx.max(initial=0) >= codes.shape[0]:
+            raise ValueError(f"帧号 {idx.max()} 超出码表长度 {codes.shape[0]}，码表和数据集对不上")
+        # -1（无效帧）夹到 0：CE 那边靠 dyn_codes_mask 屏蔽，这个值不会被用到
+        data["dyn_codes"] = np.maximum(codes[idx], 0).astype(np.int32)
+        data["dyn_codes_mask"] = valid[idx].astype(bool)
+        return data
+
+
 @dataclasses.dataclass(frozen=True)
 class PromptFromLeRobotTask(DataTransformFn):
     """Extracts a prompt from the current LeRobot dataset task."""
