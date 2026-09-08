@@ -1023,7 +1023,11 @@ _CONFIGS = [
         batch_size=32,
         num_workers=10,
         num_train_steps=60_000,
-        save_interval=10_000,
+        # 2000 而不是 10000：作业 144362 在 6.24k 步卡死，因为最近的存点还在 10k，
+        # 5 小时 40 分全部作废。keep_period 仍是 10000、max_to_keep=1，所以磁盘上只累积
+        # 10k/20k/…/60k 六个里程碑 + 一个滚动最新点（多约 48 GB），换来任何一次中断
+        # 最多只损失 2000 步（约 1.8 小时）。
+        save_interval=2_000,
         keep_period=10_000,
         fsdp_devices=1,
         seed=42,
