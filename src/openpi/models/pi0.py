@@ -116,18 +116,27 @@ class Pi0(_model.BaseModel):
                 jax.random.normal(rngs.params(), (self.dyn_slots, vlm_width)) * 0.02
             )
             n_cls = config.dyn_codebook_size
+            # ⚠️ 这里**必须**用字符串键的容器，不能用 list。
+            # openpi 到处都在做 `flax.traverse_util.flatten_dict(params, sep="/")`
+            # 把参数树拍平成 "a/b/c" —— 权重加载（weight_loaders.py:87）、orbax 存点、
+            # FSDP 分片规则全靠它。list 会让路径里出现整数下标，`"/".join` 直接抛
+            # `TypeError: sequence item 1: expected str instance, int found`。
+            # 这条路径 forward/loss 的冒烟测试不走，所以 2026-09-09 第一次真起训练才炸出来。
             if config.dyn_ce_head_mode == "per_slot":
                 # 12 个独立头：槽位 i 用 W_i，各自适配该位置的分布
-                self.dyn_heads = [
-                    nnx.Linear(vlm_width, n_cls, rngs=rngs) for _ in range(self.dyn_slots)
-                ]
+                self.dyn_head_names = tuple(f"slot{i:02d}" for i in range(self.dyn_slots))
             elif config.dyn_ce_head_mode == "per_branch":
                 # 3 个头：同一分支的 4 个槽位共享一个 W（它们索引的本来就是同一张码表）
-                self.dyn_heads = [
-                    nnx.Linear(vlm_width, n_cls, rngs=rngs) for _ in self.dyn_branch_sizes
-                ]
+                self.dyn_head_names = (
+                    ("left", "right", "env")
+                    if len(self.dyn_branch_sizes) == 3
+                    else tuple(f"branch{j}" for j in range(len(self.dyn_branch_sizes)))
+                )
             else:
                 raise ValueError(f"未知的 dyn_ce_head_mode: {config.dyn_ce_head_mode}")
+            self.dyn_heads = nnx.Dict(
+                {name: nnx.Linear(vlm_width, n_cls, rngs=rngs) for name in self.dyn_head_names}
+            )
             self.dyn_ce_head_mode = config.dyn_ce_head_mode
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -284,11 +293,12 @@ class Pi0(_model.BaseModel):
             slot_out = prefix_out[:, -self.dyn_slots :]                   # [b, n_slot, width]
             logits = []
             if self.dyn_ce_head_mode == "per_slot":
-                for i in range(self.dyn_slots):
-                    logits.append(self.dyn_heads[i](slot_out[:, i]))
+                for i, name in enumerate(self.dyn_head_names):
+                    logits.append(self.dyn_heads[name](slot_out[:, i]))
             else:  # per_branch：同一分支的槽位共用一个头
                 i = 0
-                for h, n in zip(self.dyn_heads, self.dyn_branch_sizes, strict=True):
+                for name, n in zip(self.dyn_head_names, self.dyn_branch_sizes, strict=True):
+                    h = self.dyn_heads[name]
                     for _ in range(n):
                         logits.append(h(slot_out[:, i])); i += 1
             logits = jnp.stack(logits, axis=1)                            # [b, n_slot, n_cls]

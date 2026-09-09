@@ -51,7 +51,13 @@ class CheckpointWeightLoader(WeightLoader):
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
         # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        # B1（DynaRobot）：槽位嵌入和 CE 头是我们新加的，pi05_base 里当然没有，
+        # 必须一并允许"从模型侧取随机初始化"，否则 train.py:76 的
+        # check_pytree_equality 会因为结构少两个子树而直接报错。
+        # dyn_slots=0 时这两类参数根本不会被创建 -> 正则匹配不到 -> 上游行为逐位不变。
+        return _merge_params(
+            loaded_params, params, missing_regex=r".*lora.*|dyn_slot_emb|dyn_heads/.*"
+        )
 
 
 @dataclasses.dataclass(frozen=True)
