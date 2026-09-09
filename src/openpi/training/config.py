@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -557,6 +558,12 @@ class TrainConfig:
 
 
 # Use `get_config` if you need to get a config by name in your code.
+# ── DynaRobot 站点根目录 ──────────────────────────────────────────────────────
+# 默认值 = rose 的路径，所以**不设这两个环境变量时，行为与 rose 上跑过的作业逐位一致**。
+# 新站点只需要 export 这两个变量，不用改代码、不用维护分站配置块。
+_DYN_ROOT = os.environ.get("DYNAROBOT_ROOT", "/projects/zaijia001/DynaRobot")
+_DYN_CKPT = os.environ.get("DYNAROBOT_CKPT_DIR", "/projects/_hdd/zaijia/dynarobot_checkpoints")
+
 _CONFIGS = [
     #
     # Inference Aloha configs.
@@ -1031,8 +1038,8 @@ _CONFIGS = [
         keep_period=10_000,
         fsdp_devices=1,
         seed=42,
-        assets_base_dir="/projects/zaijia001/DynaRobot/assets",
-        checkpoint_base_dir="/projects/_hdd/zaijia/dynarobot_checkpoints",  # ckpt 约 11 GB/个，放 HDD
+        assets_base_dir=f"{_DYN_ROOT}/assets",
+        checkpoint_base_dir=f"{_DYN_CKPT}",  # ckpt 约 11 GB/个，放 HDD
     ),
     TrainConfig(
         name="pi05_robotwin_b1",
@@ -1085,7 +1092,7 @@ _CONFIGS = [
                     ),
                     # 查表注入 12 个动态码 + 有效性掩码。必须排在 Repack 之后。
                     _transforms.InjectDynCodes(
-                        npz_path="/projects/zaijia001/DynaRobot/assets/dyn_codes_k10.npz"
+                        npz_path=f"{_DYN_ROOT}/assets/dyn_codes_k10.npz"
                     ),
                 ]
             ),
@@ -1093,7 +1100,7 @@ _CONFIGS = [
             # norm stats 只由 state/actions 决定，与图像、动态码无关，
             # 且**必须**和 B0 用同一份才可比 —— 指回 B0 的 assets 目录，不重算。
             assets=AssetsConfig(
-                assets_dir="/projects/zaijia001/DynaRobot/assets/pi05_robotwin",
+                assets_dir=f"{_DYN_ROOT}/assets/pi05_robotwin",
                 asset_id="RoboTwin-Clean-merged",
             ),
         ),
@@ -1113,8 +1120,8 @@ _CONFIGS = [
         keep_period=10_000,
         fsdp_devices=1,
         seed=42,
-        assets_base_dir="/projects/zaijia001/DynaRobot/assets",
-        checkpoint_base_dir="/projects/_hdd/zaijia/dynarobot_checkpoints",  # ckpt 约 11 GB/个，放 HDD
+        assets_base_dir=f"{_DYN_ROOT}/assets",
+        checkpoint_base_dir=f"{_DYN_CKPT}",  # ckpt 约 11 GB/个，放 HDD
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
