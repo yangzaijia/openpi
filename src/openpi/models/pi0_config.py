@@ -37,6 +37,12 @@ class Pi0Config(_model.BaseModelConfig):
     # 槽位各自带可学习嵌入和位置编码，位置区分不必由头再承担一遍。
     dyn_ce_head_mode: str = "per_branch"
 
+    # B1 / B2 的**唯一**区别：动作专家能不能看到 12 个槽位。
+    #   False = B1：专家看不到，槽位只经 CE 梯度去塑造共享的 VLM 权重
+    #   True  = B2：专家 attend 到槽位，动态信息真正进入动作
+    # 实现在 pi0.py 的 compute_loss 里：False 时把「suffix 行 × 槽位列」显式置 False。
+    dyn_expert_sees_slots: bool = False
+
     # Set the model specific defaults.
     action_dim: int = 32
     action_horizon: int = 50

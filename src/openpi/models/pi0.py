@@ -103,6 +103,7 @@ class Pi0(_model.BaseModel):
         # ── B1：VLM 尾部的动态槽位（dyn_slots=0 时下面什么都不建，等于上游）──────
         self.dyn_slots = config.dyn_slots
         self.dyn_ce_weight = config.dyn_ce_weight
+        self.dyn_expert_sees_slots = getattr(config, "dyn_expert_sees_slots", False)
         self.dyn_branch_sizes = tuple(config.dyn_branch_sizes)
         if self.dyn_slots > 0:
             assert sum(self.dyn_branch_sizes) == self.dyn_slots, (
@@ -268,7 +269,8 @@ class Pi0(_model.BaseModel):
             # (a) B1：动作专家看不到槽位。make_attn_mask 是单调 cumsum，后面的块必然
             #     看得到前面的块，光靠 ar_mask 屏蔽不掉，只能在这里把
             #     「suffix 行 × 槽位列」显式置 False。**这一行就是 B1 与 B2 的全部区别。**
-            attn_mask = attn_mask.at[:, n_prefix:, slot_lo:slot_hi].set(False)
+            if not self.dyn_expert_sees_slots:
+                attn_mask = attn_mask.at[:, n_prefix:, slot_lo:slot_hi].set(False)
 
             # (b) 槽位不占位置编号。否则动作 token 的 RoPE 位置会整体后移 dyn_slots，
             #     与 B0 不可比（动作到图像的相对距离被拉远）。让动作 token 的位置从
@@ -289,6 +291,10 @@ class Pi0(_model.BaseModel):
         # (c) B1 的辅助损失：12 路 CE。标签是师兄 tokenizer 离线算好的动态码。
         #     专家看不到槽位，所以这条损失影响模型的**唯一**路径是梯度回传去塑造
         #     共享的 VLM 权重 —— 这正是要回答的问题。
+        # ── wandb 指标：flow 与 CE 必须分开看 ────────────────────────────────
+        # 合并成一个数之后，"辅助任务有没有伤到 flow" 这个 B1 的**唯一**判据就读不出来了。
+        aux: dict = {"loss/flow": jnp.mean(flow_loss)}
+
         if self.dyn_slots > 0 and observation.dyn_codes is not None:
             slot_out = prefix_out[:, -self.dyn_slots :]                   # [b, n_slot, width]
             logits = []
@@ -313,10 +319,33 @@ class Pi0(_model.BaseModel):
             else:
                 denom = ce.size
             ce_mean = jnp.sum(ce) / denom
+
+            # ── 诊断指标 ────────────────────────────────────────────────────
+            # CE 从 ln(64)=4.16 掉下来不代表学会了：只要学会预测该分支最常见的码，
+            # CE 就会降。所以准确率必须和 prior_acc（batch 内众数码的频率）一起看，
+            # acc 明显高于 prior_acc 才是真的学到了东西。
+            wv = w if observation.dyn_codes_mask is not None else jnp.ones((ce.shape[0], 1), ce.dtype)
+            hit = (jnp.argmax(logits, axis=-1) == observation.dyn_codes).astype(ce.dtype)
+            ent = -jnp.sum(jnp.exp(logp) * logp, axis=-1)                 # [b, n_slot]
+            bnames = (("left", "right", "env") if len(self.dyn_branch_sizes) == 3
+                      else tuple(f"b{j}" for j in range(len(self.dyn_branch_sizes))))
+            wsum = jnp.maximum(jnp.sum(wv), 1.0)
+            i0 = 0
+            for bn, nb in zip(bnames, self.dyn_branch_sizes, strict=True):
+                sl = slice(i0, i0 + nb)
+                aux[f"ce/acc_{bn}"] = jnp.sum(hit[:, sl] * wv) / (wsum * nb)
+                aux[f"ce/loss_{bn}"] = jnp.sum(ce[:, sl]) / (wsum * nb)
+                aux[f"ce/entropy_{bn}"] = jnp.sum(ent[:, sl] * wv) / (wsum * nb)
+                cnt = jnp.sum(tgt[:, sl] * wv[:, :, None], axis=(0, 1))   # [n_cls]
+                aux[f"ce/prior_acc_{bn}"] = jnp.max(cnt) / jnp.maximum(jnp.sum(cnt), 1.0)
+                i0 += nb
+            aux["loss/ce"] = ce_mean
+            aux["ce/valid_frac"] = jnp.mean(wv)
+
             # 摊回 [b, ah] 的形状，好让上层的 jnp.mean 得到 flow + w·CE
             flow_loss = flow_loss + self.dyn_ce_weight * ce_mean
 
-        return flow_loss
+        return (flow_loss, aux) if return_aux else flow_loss
 
     @override
     def sample_actions(

@@ -1123,6 +1123,93 @@ _CONFIGS = [
         assets_base_dir=f"{_DYN_ROOT}/assets",
         checkpoint_base_dir=f"{_DYN_CKPT}",  # ckpt 约 11 GB/个，放 HDD
     ),
+    # ── B2 ────────────────────────────────────────────────────────────────
+    # 由 pi05_robotwin_b1 整块复制而来，**只改三处**：name / dyn_expert_sees_slots / fsdp_devices。
+    # ⚠️ 克隆的 config 块不会继承原块后续的修改（B1 的 save_interval 就踩过这个坑）。
+    # 改 B1 的任何超参时，必须回来同步这一块，否则两条线不可比。
+    TrainConfig(
+        name="pi05_robotwin_b2",
+        project_name="dynarobot_pi05",   # wandb 项目；team(entity) 由 WANDB_ENTITY 指定为 dynamic1
+        # action_horizon=10 @15fps = 0.67 s，与 B1 动态 token 的时间跨度（k=10）对齐。
+        # 不设 discrete_state_input：pi05_base 的参数里没有 state_proj，设成 False 会
+        # 凭空造一个随机初始化的 state 通路，预训练权重填不进去。
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            # ── B1 的全部模型侧改动就这一组 ──
+            dyn_slots=12,              # 左4+右4+环境4，与师兄 tokenizer 一一对应
+            dyn_codebook_size=64,
+            dyn_branch_sizes=(4, 4, 4),
+            dyn_ce_weight=0.01,        # flow loss 收敛在 0.010，ln(64)=4.16，×0.01 量级对齐
+            dyn_ce_head_mode="per_branch",   # 支内 4 个槽位共享一个头（同一张码表）
+            dyn_expert_sees_slots=True,      # ★ B2 与 B1 的唯一区别：专家 attend 到槽位
+        ),
+        data=LeRobotAlohaDataConfig(
+            # LeRobot 从 $HF_LEROBOT_HOME/<repo_id> 找数据；不设 assets.asset_id，
+            # 让它默认等于 repo_id，这样 compute_norm_stats 的写入路径和训练时的读取路径一致。
+            repo_id="RoboTwin-Clean-merged",
+            # adapt_to_pi=True 会按 Trossen ALOHA 约定翻转关节符号 [1,-1,-1,1,...]，并用
+            # Interbotix 硬件常数（arm_length=0.036, horn_radius=0.022）把夹爪从线性空间
+            # 换算到角度空间。RoboTwin 用的是 arx5，夹爪本身已是 0/1 归一化，套用会得到错误数值。
+            adapt_to_pi=False,
+            # RoboTwin 的 action 是绝对关节角（实测与 state 同一数值空间，action[t]-state[t]
+            # 均值仅 0.0094 rad），转成相对 chunk 起点 state 的增量；夹爪保持绝对值。
+            use_delta_joint_actions=True,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            # prompt 必须显式带过来：PromptFromLeRobotTask 在 repack **之前**包住原始
+                            # LeRobotDataset（data_loader.py:154），把每集的语言指令写进 "prompt"；而
+                            # RepackTransform 是按映射表**重建**一个新 dict，没列出的键会被丢掉。漏了这
+                            # 一行的后果是 transforms.py:254 抛 ValueError("Prompt is required")（作业
+                            # 144314 就是这么挂的）。官方 Libero / Droid 的 repack 也都显式列了这一行。
+                            "prompt": "prompt",
+                            # index = 全局帧号，InjectDynCodes 靠它查码表。
+                            # repack 按映射表**重建** dict，不列出就会被丢掉。
+                            "index": "index",
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    ),
+                    # 查表注入 12 个动态码 + 有效性掩码。必须排在 Repack 之后。
+                    _transforms.InjectDynCodes(
+                        npz_path=f"{_DYN_ROOT}/assets/dyn_codes_k10.npz"
+                    ),
+                ]
+            ),
+            base_config=DataConfig(prompt_from_task=True),  # 每集自带语言指令
+            # norm stats 只由 state/actions 决定，与图像、动态码无关，
+            # 且**必须**和 B0 用同一份才可比 —— 指回 B0 的 assets 目录，不重算。
+            assets=AssetsConfig(
+                assets_dir=f"{_DYN_ROOT}/assets/pi05_robotwin",
+                asset_id="RoboTwin-Clean-merged",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        # decay_lr == peak_lr，等价于 warmup 之后学习率恒定（沿用 pi05_zaijia 的调度）
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        batch_size=32,
+        num_workers=10,
+        num_train_steps=60_000,
+        save_interval=2_000,
+        keep_period=10_000,
+        fsdp_devices=2,   # 双卡：为显存，不为更大 batch（bs 保持 32 以与 B1 可比）
+        seed=42,
+        assets_base_dir=f"{_DYN_ROOT}/assets",
+        checkpoint_base_dir=f"{_DYN_CKPT}",  # ckpt 约 11 GB/个，放 HDD
+    ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
