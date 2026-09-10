@@ -1034,12 +1034,14 @@ _CONFIGS = [
         # 5 小时 40 分全部作废。keep_period 仍是 10000、max_to_keep=1，所以磁盘上只累积
         # 10k/20k/…/60k 六个里程碑 + 一个滚动最新点（多约 48 GB），换来任何一次中断
         # 最多只损失 2000 步（约 1.8 小时）。
-        save_interval=2_000,
+        save_interval=2_500,   # 与 B2 对齐（原 2000）。ckpt 实测 42.4 GiB/个，
+        # 不是注释里说的 11 GB —— params 12 GB + train_state 31 GB。
+        # max_to_keep=1，所以只有 keep_period 的倍数会永久留下。
         keep_period=10_000,
         fsdp_devices=1,
         seed=42,
         assets_base_dir=f"{_DYN_ROOT}/assets",
-        checkpoint_base_dir=f"{_DYN_CKPT}",  # ckpt 约 11 GB/个，放 HDD
+        checkpoint_base_dir=f"{_DYN_CKPT}",  # ckpt 实测 42.4 GiB/个（params 12G + train_state 31G），放 HDD
     ),
     TrainConfig(
         name="pi05_robotwin_b1",
@@ -1121,7 +1123,7 @@ _CONFIGS = [
         fsdp_devices=1,
         seed=42,
         assets_base_dir=f"{_DYN_ROOT}/assets",
-        checkpoint_base_dir=f"{_DYN_CKPT}",  # ckpt 约 11 GB/个，放 HDD
+        checkpoint_base_dir=f"{_DYN_CKPT}",  # ckpt 实测 42.4 GiB/个（params 12G + train_state 31G），放 HDD
     ),
     # ── B2 ────────────────────────────────────────────────────────────────
     # 由 pi05_robotwin_b1 整块复制而来，**只改三处**：name / dyn_expert_sees_slots / fsdp_devices。
@@ -1215,7 +1217,7 @@ _CONFIGS = [
                           # 在双卡上跑过 6.24k 步没问题。双卡靠数据并行，bs 仍是全局 32。
         seed=42,
         assets_base_dir=f"{_DYN_ROOT}/assets",
-        checkpoint_base_dir=f"{_DYN_CKPT}",  # ckpt 约 11 GB/个，放 HDD
+        checkpoint_base_dir=f"{_DYN_CKPT}",  # ckpt 实测 42.4 GiB/个（params 12G + train_state 31G），放 HDD
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
