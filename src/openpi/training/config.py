@@ -1056,7 +1056,9 @@ _CONFIGS = [
             dyn_slots=12,              # 左4+右4+环境4，与师兄 tokenizer 一一对应
             dyn_codebook_size=64,
             dyn_branch_sizes=(4, 4, 4),
-            dyn_ce_weight=0.01,        # flow loss 收敛在 0.010，ln(64)=4.16，×0.01 量级对齐
+            dyn_ce_weight=0.1,         # 2026-09-11 用户定：0.01 -> 0.1。
+                                       # ⚠️ 注意量级：flow 收敛在 0.010，CE 起点 ln(64)=4.16，
+                                       # 0.01 时 CE 分量约 4× flow，0.1 时约 40×，总 loss 由 CE 主导。
             dyn_ce_head_mode="per_branch",   # 支内 4 个槽位共享一个头（同一张码表）
         ),
         data=LeRobotAlohaDataConfig(
@@ -1117,9 +1119,12 @@ _CONFIGS = [
         ema_decay=0.999,
         batch_size=32,
         num_workers=10,
-        num_train_steps=60_000,
-        save_interval=2_000,
-        keep_period=10_000,
+        num_train_steps=20_000,   # 2026-09-11 用户定：60k -> 20k
+        save_interval=2_500,      # 2026-09-11 用户定：2000 -> 2500
+        # checkpoints.py 是 max_to_keep=1：只留最新的一个 + keep_period 的整数倍。
+        # keep_period=5000 + save_interval=2500 => 永久保留 5000/10000/15000/20000 四个，
+        # 2500 的奇数倍只在下一次保存前短暂存在。ckpt 实测 42.4 GiB/个 => 约 170 GiB。
+        keep_period=5_000,        # 2026-09-11 用户定：10000 -> 5000
         fsdp_devices=1,
         seed=42,
         assets_base_dir=f"{_DYN_ROOT}/assets",
