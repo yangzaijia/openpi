@@ -1210,7 +1210,9 @@ _CONFIGS = [
         # 代价：非 10000 倍数的 ckpt（2500/5000/7500…）只在下一次保存前存在，
         # 按 4.5 s/it 算约 3.1 小时窗口 —— 要手动取 5000 的那个必须在窗口内拿走。
         keep_period=10_000,
-        fsdp_devices=2,   # 双卡：为显存，不为更大 batch（bs 保持 32 以与 B1 可比）
+        fsdp_devices=1,   # 与 B0/B1 一致。fsdp=2 在这批 Blackwell 上第一个 train step 就
+                          # ncclGroupEnd() unhandled cuda error（作业 148493）；B0 用 fsdp=1
+                          # 在双卡上跑过 6.24k 步没问题。双卡靠数据并行，bs 仍是全局 32。
         seed=42,
         assets_base_dir=f"{_DYN_ROOT}/assets",
         checkpoint_base_dir=f"{_DYN_CKPT}",  # ckpt 约 11 GB/个，放 HDD
