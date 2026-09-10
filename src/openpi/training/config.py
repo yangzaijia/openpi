@@ -1203,7 +1203,12 @@ _CONFIGS = [
         batch_size=32,
         num_workers=10,
         num_train_steps=60_000,
-        save_interval=2_000,
+        save_interval=2_500,   # 每 2500 步写一次
+        # ⚠️ checkpoints.py 是 max_to_keep=1：只留最新的一个 + keep_period 整数倍。
+        # 想手上有 5000 倍数的 ckpt，keep_period 必须是 5000，光改 save_interval 没用。
+        # 这里定为 10000（6 个 × 约 12 GB ≈ 72 GB），为省 HDD 配额（余约 307 GiB）。
+        # 代价：非 10000 倍数的 ckpt（2500/5000/7500…）只在下一次保存前存在，
+        # 按 4.5 s/it 算约 3.1 小时窗口 —— 要手动取 5000 的那个必须在窗口内拿走。
         keep_period=10_000,
         fsdp_devices=2,   # 双卡：为显存，不为更大 batch（bs 保持 32 以与 B1 可比）
         seed=42,
