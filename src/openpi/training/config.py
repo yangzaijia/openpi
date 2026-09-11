@@ -1117,8 +1117,9 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
-        batch_size=32,
-        num_workers=10,
+        batch_size=64,            # 2026-09-11 用户定：双卡 × 每卡 32，与 B0 对齐
+                                  # ⚠️ cartin4 那条 B1 是 32（单卡 32），两者【不能按 step 叠图】
+        num_workers=12,           # 与 B0 对齐（4 卡分配发 16 核）
         num_train_steps=20_000,   # 2026-09-11 用户定：60k -> 20k
         save_interval=2_500,      # 2026-09-11 用户定：2000 -> 2500
         # checkpoints.py 是 max_to_keep=1：只留最新的一个 + keep_period 的整数倍。
