@@ -1120,7 +1120,9 @@ _CONFIGS = [
         batch_size=64,            # 2026-09-11 用户定：双卡 × 每卡 32，与 B0 对齐
                                   # ⚠️ cartin4 那条 B1 是 32（单卡 32），两者【不能按 step 叠图】
         num_workers=12,           # 与 B0 对齐（4 卡分配发 16 核）
-        num_train_steps=20_000,   # 2026-09-11 用户定：60k -> 20k
+        num_train_steps=60_000,   # 2026-09-11 用户定：20k -> 60k。
+                                  # ⚠️ 按每卡 32 的 4.7 s/it 估需约 78 h > 3 天墙钟，
+                                  #    会被切在约 55k 步，需要再交一次走 --resume 续。
         save_interval=2_500,      # 2026-09-11 用户定：2000 -> 2500
         # checkpoints.py 是 max_to_keep=1：只留最新的一个 + keep_period 的整数倍。
         # keep_period=5000 + save_interval=2500 => 永久保留 5000/10000/15000/20000 四个，
