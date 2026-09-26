@@ -21,6 +21,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.rrsim_policy as rrsim_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -348,6 +349,58 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory()(model_config)
 
         # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotRrsimDataConfig(DataConfigFactory):
+    """rr-sim (Industrial_Arm 单臂真机) 数据配置。仿 LeRobotLiberoDataConfig（单臂骨架），改两处：
+    ① repack 映射 rr-sim 的 LeRobot 键（observation.images.view1/hand、observation.state、action）；
+    ② 用 rrsim_policy.RrsimInputs/RrsimOutputs（state 切前 7 维去力、2 相机映射，第三槽零填 mask=False）。
+    extra_delta_transform=True 时对前 6 维做 delta（相对 chunk 起点当前 state 逐分量相减）、gripper 绝对。
+    详见 DynaRobot/rr-sim/00_rr-sim_pi05_训练设定.zh.md。
+    """
+
+    extra_delta_transform: bool = False
+    # B1/B2：设了就注入离线动态码（repack 补 index + append InjectDynCodes）；None=RR0 baseline 行为逐字不变。
+    dyn_codes_npz: str | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        _repack_map = {
+            "observation/image": "observation.images.view1",
+            "observation/wrist_image": "observation.images.hand",
+            "observation/state": "observation.state",
+            "actions": "action",
+            "prompt": "prompt",
+        }
+        if self.dyn_codes_npz is not None:
+            _repack_map["index"] = "index"   # InjectDynCodes 靠全局帧号查表
+        _repack_inputs = [_transforms.RepackTransform(_repack_map)]
+        if self.dyn_codes_npz is not None:
+            _repack_inputs.append(_transforms.InjectDynCodes(npz_path=self.dyn_codes_npz))
+        repack_transform = _transforms.Group(inputs=_repack_inputs)
+
+        data_transforms = _transforms.Group(
+            inputs=[rrsim_policy.RrsimInputs(model_type=model_config.model_type)],
+            outputs=[rrsim_policy.RrsimOutputs()],
+        )
+
+        if self.extra_delta_transform:
+            # 前 6 维（xyz + rotvec）做 delta，第 7 维 gripper 绝对。
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
@@ -1119,6 +1172,7 @@ _CONFIGS = [
         ema_decay=0.999,
         batch_size=64,            # 2026-09-11 用户定：双卡 × 每卡 32，与 B0 对齐
                                   # ⚠️ cartin4 那条 B1 是 32（单卡 32），两者【不能按 step 叠图】
+                                  # B2 当前仍是 32，B1/B2 对比也须按样本数对齐。
         num_workers=12,           # 与 B0 对齐（4 卡分配发 16 核）
         num_train_steps=60_000,   # 2026-09-11 用户定：20k -> 60k。
                                   # ⚠️ 按每卡 32 的 4.7 s/it 估需约 78 h > 3 天墙钟，
@@ -1226,6 +1280,293 @@ _CONFIGS = [
         seed=42,
         assets_base_dir=f"{_DYN_ROOT}/assets",
         checkpoint_base_dir=f"{_DYN_CKPT}",  # ckpt 实测 42.4 GiB/个（params 12G + train_state 31G），放 HDD
+    ),
+    TrainConfig(
+        name="pi05_rrsim",
+        project_name="dynarobot_pi05",   # wandb 项目；entity 由 WANDB_ENTITY=dynamic1 指定
+        # action_horizon=10 @15fps = 0.67s，沿用 B0/piper。
+        # 不设 discrete_state_input：Pi0Config 默认取 pi05(=True)，pi05_base 用离散 state 通路、无 state_proj；
+        # 设 False 会凭空造随机 state_proj，预训练权重填不进去（同 B0 pi05_robotwin 的判定）。
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10),
+        data=LeRobotRrsimDataConfig(
+            # LeRobot 从 $HF_LEROBOT_HOME/<repo_id> 找数据。
+            # 软链：$HF_LEROBOT_HOME/rrsim_0918_clean -> data/rr-sim/processed/lerobot_tasks_0918_clean_final
+            repo_id="rrsim_0918_clean",
+            # rr-sim action 是绝对 EE-pose（rotvec）；转成相对 chunk 起点 state 的 delta（前 6 维），gripper 绝对。
+            # 实测 naive 相减 vs 几何 R⁻¹R delta 误差 mean 0.024°/p95 0.036°（臂几乎不转 + dynadata 已 unwrap 2π），原生 delta 足够。
+            extra_delta_transform=True,
+            # 每集自带语言指令；action_sequence_keys=("action",) 对齐 rr-sim 的动作键名。
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        # warmup 后恒定 5e-5（同 B0/piper/foundary）。
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        batch_size=64,          # 全局 batch；双卡数据并行 → 32/卡（effective 64，用户 2026-09-20 定；lr 仍 5e-5）
+        num_workers=8,
+        num_train_steps=30_000,
+        # save 2500 / keep 5000（用户 2026-09-20 定）：每 2500 滚动存点（崩溃最多丢 2500 步）；
+        # keep_period=5000 → 永久保留 5k/10k/15k/20k/25k/30k；max_to_keep 默认只留 1 个滚动最新点。
+        save_interval=2_500,
+        keep_period=5_000,
+        fsdp_devices=1,         # fsdp=2 在 Blackwell 上第一步就 ncclGroupEnd 失败；双卡走数据并行
+        seed=42,
+        assets_base_dir=f"{_DYN_ROOT}/assets",
+        checkpoint_base_dir=f"{_DYN_CKPT}",  # HDD；run_pi05.sh 会把 DYNAROBOT_CKPT_DIR 指到 $DYN_HDD/ckpt/openpi
+    ),
+    # ── RR-B1 / RR-B2：RR0 + dyntok-slots CE（2-token tokenizer：arm/env 两支各 2 槽=4）──
+    #   标签 dyn_codes_k15.npz（A7S3-15k，k=15）；norm_stats 复用 RR0（assets 指回 pi05_rrsim，可比）。
+    #   B1: 专家看不到槽位（dyn_expert_sees_slots 默认 False）；B2: 专家可读槽位（=True）。唯一区别就这一项。
+    TrainConfig(
+        name="pi05_rrsim_b1",
+        project_name="dynarobot_pi05",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            dyn_slots=4,
+            dyn_codebook_size=64,
+            dyn_branch_sizes=(2, 2),
+            dyn_ce_weight=0.01,
+            dyn_ce_head_mode="per_branch",
+        ),
+        data=LeRobotRrsimDataConfig(
+            repo_id="rrsim_0918_clean",
+            extra_delta_transform=True,
+            dyn_codes_npz=f"{_DYN_ROOT}/assets/pi05_rrsim/dyn_codes_k15.npz",
+            assets=AssetsConfig(assets_dir=f"{_DYN_ROOT}/assets/pi05_rrsim", asset_id="rrsim_0918_clean"),
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        batch_size=64,
+        num_workers=8,
+        num_train_steps=30_000,
+        save_interval=2_500,
+        keep_period=5_000,
+        fsdp_devices=1,
+        seed=42,
+        assets_base_dir=f"{_DYN_ROOT}/assets",
+        checkpoint_base_dir=f"{_DYN_CKPT}",
+    ),
+    TrainConfig(
+        name="pi05_rrsim_b2",
+        project_name="dynarobot_pi05",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            dyn_slots=4,
+            dyn_codebook_size=64,
+            dyn_branch_sizes=(2, 2),
+            dyn_ce_weight=0.01,
+            dyn_ce_head_mode="per_branch",
+            dyn_expert_sees_slots=True,   # ★ B2 与 B1 的唯一区别：专家 attend 到槽位
+        ),
+        data=LeRobotRrsimDataConfig(
+            repo_id="rrsim_0918_clean",
+            extra_delta_transform=True,
+            dyn_codes_npz=f"{_DYN_ROOT}/assets/pi05_rrsim/dyn_codes_k15.npz",
+            assets=AssetsConfig(assets_dir=f"{_DYN_ROOT}/assets/pi05_rrsim", asset_id="rrsim_0918_clean"),
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        batch_size=64,
+        num_workers=8,
+        num_train_steps=30_000,
+        save_interval=2_500,
+        keep_period=5_000,
+        fsdp_devices=1,
+        seed=42,
+        assets_base_dir=f"{_DYN_ROOT}/assets",
+        checkpoint_base_dir=f"{_DYN_CKPT}",
+    ),
+    # ── cropA 第二轮（2026-09-22）：数据 0918+0921 cropA（253 集/13 任务），tokenizer Δ[5,45]，标签 k=10。
+    #   与 pi05_rrsim / _b1 / _b2 逐字相同，只换 repo_id / assets / 标签文件。norm_stats 三者共用（B1/B2 指回 pi05_rrsim_cropA）。
+    TrainConfig(
+        name="pi05_rrsim_cropA",
+        project_name="dynarobot_pi05",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10),
+        data=LeRobotRrsimDataConfig(
+            # 软链：$HF_LEROBOT_HOME/rrsim_0918_0921_cropA -> data/rr-sim/processed/lerobot_tasks_0918_0921_cropA_clean_final
+            repo_id="rrsim_0918_0921_cropA",
+            extra_delta_transform=True,
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        batch_size=64,
+        num_workers=8,
+        num_train_steps=30_000,
+        save_interval=2_500,
+        keep_period=5_000,
+        fsdp_devices=1,
+        seed=42,
+        assets_base_dir=f"{_DYN_ROOT}/assets",
+        checkpoint_base_dir=f"{_DYN_CKPT}",
+    ),
+    TrainConfig(
+        name="pi05_rrsim_cropA_v3",
+        project_name="dynarobot_pi05",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10),
+        data=LeRobotRrsimDataConfig(
+            # V3 旋转窗口保护；独立数据软链与独立 norm_stats。
+            repo_id="rrsim_0918_0921_cropA_v3",
+            extra_delta_transform=True,
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        batch_size=64,
+        num_workers=8,
+        num_train_steps=30_000,
+        save_interval=2_500,
+        keep_period=5_000,
+        fsdp_devices=1,
+        seed=42,
+        assets_base_dir=f"{_DYN_ROOT}/assets",
+        checkpoint_base_dir=f"{_DYN_CKPT}",
+    ),
+    TrainConfig(
+        name="pi05_rrsim_cropA_b1",
+        project_name="dynarobot_pi05",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            dyn_slots=4,
+            dyn_codebook_size=64,
+            dyn_branch_sizes=(2, 2),
+            dyn_ce_weight=0.01,
+            dyn_ce_head_mode="per_branch",
+        ),
+        data=LeRobotRrsimDataConfig(
+            repo_id="rrsim_0918_0921_cropA",
+            extra_delta_transform=True,
+            dyn_codes_npz=f"{_DYN_ROOT}/assets/pi05_rrsim_cropA/dyn_codes_k10.npz",
+            assets=AssetsConfig(assets_dir=f"{_DYN_ROOT}/assets/pi05_rrsim_cropA", asset_id="rrsim_0918_0921_cropA"),
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        batch_size=64,
+        num_workers=8,
+        num_train_steps=30_000,
+        save_interval=2_500,
+        keep_period=5_000,
+        fsdp_devices=1,
+        seed=42,
+        assets_base_dir=f"{_DYN_ROOT}/assets",
+        checkpoint_base_dir=f"{_DYN_CKPT}",
+    ),
+    TrainConfig(
+        name="pi05_rrsim_cropA_b2",
+        project_name="dynarobot_pi05",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            dyn_slots=4,
+            dyn_codebook_size=64,
+            dyn_branch_sizes=(2, 2),
+            dyn_ce_weight=0.01,
+            dyn_ce_head_mode="per_branch",
+            dyn_expert_sees_slots=True,   # ★ B2 与 B1 的唯一区别
+        ),
+        data=LeRobotRrsimDataConfig(
+            repo_id="rrsim_0918_0921_cropA",
+            extra_delta_transform=True,
+            dyn_codes_npz=f"{_DYN_ROOT}/assets/pi05_rrsim_cropA/dyn_codes_k10.npz",
+            assets=AssetsConfig(assets_dir=f"{_DYN_ROOT}/assets/pi05_rrsim_cropA", asset_id="rrsim_0918_0921_cropA"),
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        batch_size=64,
+        num_workers=8,
+        num_train_steps=30_000,
+        save_interval=2_500,
+        keep_period=5_000,
+        fsdp_devices=1,
+        seed=42,
+        assets_base_dir=f"{_DYN_ROOT}/assets",
+        checkpoint_base_dir=f"{_DYN_CKPT}",
+    ),
+    TrainConfig(
+        name="pi05_rrsim_cropA_d8_13_b2",
+        project_name="dynarobot_pi05",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            dyn_slots=4,
+            dyn_codebook_size=64,
+            dyn_branch_sizes=(2, 2),
+            dyn_ce_weight=0.01,
+            dyn_ce_head_mode="per_branch",
+            dyn_expert_sees_slots=True,   # ★ B2 与 B1 的唯一区别
+        ),
+        data=LeRobotRrsimDataConfig(
+            repo_id="rrsim_0918_0921_cropA",
+            extra_delta_transform=True,
+            dyn_codes_npz=f"{_DYN_ROOT}/assets/pi05_rrsim_cropA_d8_13/dyn_codes_k10.npz",
+            assets=AssetsConfig(assets_dir=f"{_DYN_ROOT}/assets/pi05_rrsim_cropA", asset_id="rrsim_0918_0921_cropA"),
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        batch_size=64,
+        num_workers=8,
+        num_train_steps=30_000,
+        save_interval=2_500,
+        keep_period=5_000,
+        fsdp_devices=1,
+        seed=42,
+        assets_base_dir=f"{_DYN_ROOT}/assets",
+        checkpoint_base_dir=f"{_DYN_CKPT}",
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),

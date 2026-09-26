@@ -15,6 +15,13 @@ from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
 
+# [infer-match-train] opt-in（默认关，环境变量 PI0_INFER_MATCH_TRAIN=1 开）：修正 sample_actions
+# 与 compute_loss 的训练/推理不一致——① 动作专家对 dyn slots 的注意力屏蔽（仅 B1）② 动作 RoPE
+# 位置不含 slots 偏移（B1+B2）。默认关时下面两处分支都走 else，行为逐字与原版一致，不影响
+# RR 线 / 现有 eval 口径 / 训练。eval 时在启动环境 export PI0_INFER_MATCH_TRAIN=1 即可。
+import os as _os
+_INFER_MATCH_TRAIN = _os.environ.get("PI0_INFER_MATCH_TRAIN", "0") == "1"
+
 
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
@@ -382,6 +389,11 @@ class Pi0(_model.BaseModel):
             # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
             # prefix tokens
             prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            # [infer-match-train] 训练（compute_loss:273-274）B1 动作专家看不到 slots；推理默认没屏蔽 → 不一致。
+            # 开关打开且专家看不到 slots（B1）时，补上同样的「动作行 × slot 列」屏蔽。B2（sees_slots）不受影响。
+            if _INFER_MATCH_TRAIN and self.dyn_slots > 0 and not self.dyn_expert_sees_slots:
+                _n_prefix = prefix_tokens.shape[1]
+                prefix_attn_mask = prefix_attn_mask.at[:, :, _n_prefix - self.dyn_slots : _n_prefix].set(False)
             # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
             # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
             full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
@@ -391,7 +403,14 @@ class Pi0(_model.BaseModel):
                 prefix_tokens.shape[1] + suffix_tokens.shape[1],
             )
             # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            # [infer-match-train] 训练（compute_loss:283）动作位置从 image/text 之后接着数，slots 不占位；
+            # 推理默认把 slots 也算进起点（sum(prefix_mask) 含 dyn_slots）→ 动作 RoPE 位置整体后移 dyn_slots。
+            # 开关打开时扣掉 dyn_slots，与训练一致（B1+B2 都需要）。
+            if _INFER_MATCH_TRAIN and self.dyn_slots > 0:
+                _n_img_txt = jnp.sum(prefix_mask, axis=-1)[:, None] - self.dyn_slots
+                positions = _n_img_txt + jnp.cumsum(suffix_mask, axis=-1) - 1
+            else:
+                positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens],
