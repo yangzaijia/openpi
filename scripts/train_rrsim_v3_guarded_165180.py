@@ -269,6 +269,9 @@ def main(config: _config.TrainConfig):
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+    checkpoint_saver = _checkpoints.ResilientCheckpointSaver(
+        checkpoint_manager, config.checkpoint_dir, keep_period=config.keep_period
+    )
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
@@ -302,10 +305,10 @@ def main(config: _config.TrainConfig):
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             if config.name == "pi05_rrsim_cropA_v3":
                 _wait_for_b2_checkpoint_gap()
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            checkpoint_saver.save_state(train_state, data_loader, step)
 
     logging.info("Waiting for checkpoint manager to finish")
-    checkpoint_manager.wait_until_finished()
+    checkpoint_saver.finish(train_state, data_loader, config.num_train_steps - 1)
 
 
 if __name__ == "__main__":
